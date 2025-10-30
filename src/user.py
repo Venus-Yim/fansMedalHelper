@@ -149,6 +149,9 @@ class BiliUser:
         """根据白名单/黑名单生成粉丝牌任务列表，保持白名单顺序"""
         self.medals.clear()
         all_medals = {}
+        like_cd=self.config.get("LIKE_CD",0.3)
+        danmaku_cd=self.config.get("DANMAKU_CD",3)
+        watch_cd=self.config.get("WATCH_TARGET",25)
         
         self.log.info(f"开始获取任务列表，粉丝牌顺序为（排名先后即为执行任务先后）：")
         
@@ -194,18 +197,17 @@ class BiliUser:
 
         for medal in self.medals:
             uid = medal["medal"]["target_id"]
-            # 点赞和弹幕任务，剔除已完成
-            if uid not in logs.get("like", []):
+            if like_cd and uid not in logs.get("like", []):
                 self.like_list.append(medal)
-            if uid not in logs.get("danmaku", []):
+            if danmaku_cd and uid not in logs.get("danmaku", []):
                 self.danmaku_list.append(medal)
-            # 观看任务全部加入，执行时再判断是否完成
-            try:
-                watched = await self.api.getWatchLiveProgress(uid) * 5
-                if watched < WATCH_TARGET:
-                    self.watch_list.append(medal)
-            except Exception as e:
-                self.log.warning(f"{medal['anchor_info']['nick_name']} 获取直播状态失败: {e}")
+            if watch_cd:
+                try:
+                    watched = await self.api.getWatchLiveProgress(uid) * 5
+                    if watched < WATCH_TARGET:
+                        self.watch_list.append(medal)
+                except Exception as e:
+                    self.log.warning(f"{medal['anchor_info']['nick_name']} 获取直播状态失败: {e}")
             
         self.log.success(f"任务列表共 {len(self.medals)} 个粉丝牌(待点赞: {len(self.like_list)}, 待弹幕: {len(self.danmaku_list)}, 待观看: {len(self.watch_list)})\n")
 
@@ -231,7 +233,7 @@ class BiliUser:
                 except Exception as e:
                     fail_count += 1
                     self.log.warning(f"{name} 第 {i+1}/{times} 次点赞失败: {e}， 进行重试 (第{fail_count}/3次)")
-
+                    
                     if fail_count < 3:
                         await asyncio.sleep(1)  # 等待1秒后重试
                     else:
@@ -265,7 +267,7 @@ class BiliUser:
                 except Exception as e:
                     fail_count += 1
                     self.log.warning(f"{name} 第 {i+1}/{times} 条弹幕失败: {e}，进行重试 (第{fail_count}/3次)")
-
+                        
                     if fail_count < 3:
                         await asyncio.sleep(5)  # 等待5秒后重试
                     else:
@@ -446,17 +448,24 @@ class BiliUser:
         await self.session.close()
         
         # ---- 等待到下一天后自动重启 ----
-        now = self._now_beijing()
-        next_day = (now + timedelta(days=1)).replace(hour=0, minute=5, second=5, microsecond=0)
-        sleep_seconds = (next_day - now).total_seconds()
-        self.log.info(f"等待至北京时间 {next_day.strftime('%Y-%m-%d %H:%M:%S')} 自动开始新任务（约 {sleep_seconds/3600:.2f} 小时）")
-        await asyncio.sleep(sleep_seconds)
-        if self.api.session and not self.api.session.closed:
-            await self.api.session.close()
-        self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
-        try:
-            await self.start()
-        except Exception as e:
-            self.log.error(f"主任务执行出错：{e}")
-            await asyncio.sleep(60)
-            await self.start()
+        cron = self.config.get("CRON", None)
+        if cron:
+            base_time = self._now_beijing()
+            cron_iter = croniter(cron, base_time)
+            next_run_time = cron_iter.get_next(datetime)
+
+            sleep_seconds = (next_run_time - base_time).total_seconds()
+            self.log.info(f"等待至北京时间 {next_run_time.strftime('%Y-%m-%d %H:%M:%S')} 自动开始新任务（约 {sleep_seconds/3600:.2f} 小时）")
+
+            await asyncio.sleep(sleep_seconds)
+            
+            if self.api.session and not self.api.session.closed:
+                await self.api.session.close()
+            self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
+            try:
+                await self.start()
+            except Exception as e:
+                self.log.error(f"主任务执行出错：{e}")
+                await asyncio.sleep(60)
+                await self.start()
+
