@@ -30,6 +30,7 @@
 ### 使用说明
 
 详细文档在这里 👉 [文档](https://Venus-Yim.github.io/fansMedalHelperVersion) 
+
 **请细心阅读**
 
 ---
