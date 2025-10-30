@@ -46,24 +46,24 @@ except Exception as e:
 async def main():
     messageList = []
     async with aiohttp.ClientSession(trust_env=True) as session:
-        try:
-            log.warning("当前版本为: " + __VERSION__)
-            resp = await (
-                await session.get(
-                    "http://version.fansmedalhelper.1961584514352337.cn-hangzhou.fc.devsapp.net/"
-                )
-            ).json()
-            if resp["version"] != __VERSION__:
-                log.warning(f"新版本为: {resp['version']}，请更新")
-                log.warning("更新内容: " + resp["changelog"])
-                messageList.append(f"当前版本: {__VERSION__}，最新版本: {resp['version']}")
-                messageList.append(f"更新内容: {resp['changelog']}")
-            if resp["notice"]:
-                log.warning("公告: " + resp["notice"])
-                messageList.append(f"公告: {resp['notice']}")
-        except Exception as ex:
-            log.warning(f"检查版本失败: {ex}")
-            messageList.append(f"检查版本失败: {ex}")
+#         try:
+#             log.warning("当前版本为: " + __VERSION__)
+#             resp = await (
+#                 await session.get(
+#                     "http://version.fansmedalhelper.1961584514352337.cn-hangzhou.fc.devsapp.net/"
+#                 )
+#             ).json()
+#             if resp["version"] != __VERSION__:
+#                 log.warning(f"新版本为: {resp['version']}，请更新")
+#                 log.warning("更新内容: " + resp["changelog"])
+#                 messageList.append(f"当前版本: {__VERSION__}，最新版本: {resp['version']}")
+#                 messageList.append(f"更新内容: {resp['changelog']}")
+#             if resp["notice"]:
+#                 log.warning("公告: " + resp["notice"])
+#                 messageList.append(f"公告: {resp['notice']}")
+#         except Exception as ex:
+#             log.warning(f"检查版本失败: {ex}")
+#             messageList.append(f"检查版本失败: {ex}")
 
         # ------------------------------
         # 创建任务
@@ -131,13 +131,15 @@ if __name__ == "__main__":
     cron = users.get("CRON", None)
 
     if cron:
-        from apscheduler.schedulers.blocking import BlockingScheduler
-        from apscheduler.triggers.cron import CronTrigger
-
-        log.info(f"使用内置定时器 {cron}，开启定时任务。")
-        scheduler = BlockingScheduler()
-        scheduler.add_job(run, CronTrigger.from_crontab(cron), misfire_grace_time=3600)
-        scheduler.start()
+#         from apscheduler.schedulers.blocking import BlockingScheduler
+#         from apscheduler.triggers.cron import CronTrigger
+# 
+#         log.info(f"使用内置定时器 {cron}，开启定时任务。")
+#         scheduler = BlockingScheduler()
+#         scheduler.add_job(run, CronTrigger.from_crontab(cron), misfire_grace_time=3600)
+#         scheduler.start()
+        log.info("已配置定时器，开启循环任务。")
+        run()
     elif "--auto" in sys.argv:
         from apscheduler.schedulers.blocking import BlockingScheduler
         from apscheduler.triggers.interval import IntervalTrigger
