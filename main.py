@@ -8,7 +8,7 @@ import aiohttp
 from src import BiliUser
 
 log = logger.bind(user="B站粉丝牌助手")
-__VERSION__ = "0.3.9"
+__VERSION__ = "0.4.0"
 
 warnings.filterwarnings(
     "ignore",
