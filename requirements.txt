@@ -1,5 +1,6 @@
-aiohttp 
-aiohttp_socks
-loguru 
-pyyaml 
-apscheduler
+aiohttp>=3.8.0
+aiohttp-socks>=0.8.0
+loguru>=0.7.0
+PyYAML>=6.0
+APScheduler>=3.10.0
+pytz>=2023.3
