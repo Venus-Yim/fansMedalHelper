@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://s21.ax1x.com/2025/10/28/pVxwkmq.jpg" width="200" height="200" alt="">
+  <img src="https://s1.ax1x.com/2022/05/24/XPx1tx.png" width="200" height="200" alt="">
 </p>
 <div align="center">
 <h1> 新 B 站粉丝牌助手
