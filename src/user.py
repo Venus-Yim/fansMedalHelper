@@ -197,9 +197,9 @@ class BiliUser:
 
         for medal in self.medals:
             uid = medal["medal"]["target_id"]
-            if like_cd and uid not in logs.get("like", []):
+            if like_cd and uid not in logs.get("like", []) and (medal['medal']['is_lighted']==0 or medal["medal"]["guard_level"]>0):
                 self.like_list.append(medal)
-            if danmaku_cd and uid not in logs.get("danmaku", []):
+            if danmaku_cd and uid not in logs.get("danmaku", [])  and (medal['medal']['is_lighted']==0 or medal["medal"]["guard_level"]>0):
                 self.danmaku_list.append(medal)
             if watch_cd:
                 try:
@@ -292,11 +292,22 @@ class BiliUser:
                 if watched >= WATCH_TARGET:
                     watch_list.remove(medal)
                     continue
-                status = await self.api.getRoomLiveStatus(room_id)
-                if status != 2:  # 轮播房间跳过
-                    return medal
+                if await self.api.get_medal_light_status(uid)==0:
+                    status = await self.api.getRoomLiveStatus(room_id)
+                    if status == 1:
+                        await self.like_room(room_id, medal, times=36)
+                    else:
+                        await self.send_danmaku(room_id, medal, times=10)
+                    if await self.api.get_medal_light_status(uid)==0:
+                        self.log.error(f"{medal['anchor_info']['nick_name']} 灯牌点亮失败，已将灯牌放至列表最后")
+                        watch_list.remove(medal)
+                        watch_list.append(medal)
+                        continue
+                        
+                return medal
+                    
             except Exception as e:
-                self.log.warning(f"{medal['anchor_info']['nick_name']} 获取直播状态失败: {e}")
+                self.log.warning(f"{medal['anchor_info']['nick_name']} 判定是否可观看失败: {e}")
                 continue
         return None  # 没有可观看房间
     
@@ -468,4 +479,3 @@ class BiliUser:
                 self.log.error(f"主任务执行出错：{e}")
                 await asyncio.sleep(60)
                 await self.start()
-

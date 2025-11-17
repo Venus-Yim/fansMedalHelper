@@ -108,7 +108,7 @@ class BiliApiError(Exception):
         self.msg = msg
 
     def __str__(self):
-        return self.msg
+        return f"错误代码({self.code}):{self.msg}"
 
 
 class BiliApi:
@@ -176,6 +176,20 @@ class BiliApi:
             if not data["list"]:
                 break
             params["page"] += 1
+    
+    @retry()
+    async def get_medal_light_status(self, target_id: int) -> int | None:
+        """
+        根据 target_id 获取该粉丝牌的点亮状态
+        返回：
+            1 表示点亮，0 表示未点亮，None 表示没找到该勋章
+        """
+        async for medal in self.getFansMedalandRoomID():
+            # medal结构内的目标ID字段名为 'medal' -> 'target_id'
+            if medal.get('medal', {}).get('target_id') == target_id:
+                return medal['medal'].get('is_lighted')
+        return None
+
     
     @retry()
     async def getRoomLiveStatus(self, room_id: int) -> int:
