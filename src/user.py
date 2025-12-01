@@ -87,12 +87,21 @@ class BiliUser:
         self.medals = []
         self.message = []
         self.errmsg = []
+        self.is_awake = True
         
         self.uuids = str(uuid.uuid4())
         self.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
         self.api = BiliApi(self, self.session)
+        self._current_watch_task = None
 
-        self.log = logger.bind(user="未知用户")
+        self.log = logger.bind(user=self.name or "未知用户", uid=self.uuids)
+        self.log_file = f"logs/{self.uuids}.log"
+        self.sink_id = logger.add(
+            self.log_file,
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
+            filter=lambda record: record["extra"].get("uid") == self.uuids,
+            encoding="utf-8"
+        )
     
     
     # ---------- 对当日已完成任务进行本地存储，避免当日重复打开后多次执行 ----------
@@ -100,7 +109,7 @@ class BiliUser:
         return datetime.now(pytz.timezone("Asia/Shanghai"))
 
     def _log_file(self):
-        return os.path.join(os.path.dirname(__file__), "task_log.json")
+        return os.path.join(os.path.dirname(__file__), f"task_log_{self.access_key}.json")
 
     def _load_log(self):
         try:
@@ -246,6 +255,8 @@ class BiliUser:
 
     # ------------------------- 弹幕任务 -------------------------
     async def send_danmaku(self, room_id, medal, times=10):
+        if room_id == 10451956:
+            return
         name = medal["anchor_info"]["nick_name"]
         target_id = medal["medal"]["target_id"]
         success_count = 0
@@ -280,7 +291,7 @@ class BiliUser:
     # ------------------------- 观看任务 -------------------------
     async def get_next_watchable(self, watch_list):
         """
-        返回列表中最靠前的可观看房间（观看时长未达到25 min  且  不是轮播直播间）
+        返回列表中最靠前的可观看房间（观看时长未达到25 min）
         """
         WATCH_TARGET = self.config.get("WATCH_TARGET", 25)
         for medal in watch_list.copy():
@@ -302,6 +313,7 @@ class BiliUser:
                         self.log.error(f"{medal['anchor_info']['nick_name']} 灯牌点亮失败，已将灯牌放至列表最后")
                         watch_list.remove(medal)
                         watch_list.append(medal)
+                        await asyncio.sleep(0)
                         continue
                         
                 return medal
@@ -343,8 +355,10 @@ class BiliUser:
                 return True
 
             if attempts >= MAX_ATTEMPTS:
-                self.log.error(f"{name} 超过最大尝试 {MAX_ATTEMPTS} 分钟，停止观看")
-                return True
+                self.log.error(f"{name} 超过最大尝试 {MAX_ATTEMPTS} 分钟，停止观看。该灯牌被放至观看队列最后。")
+                self.watch_list.remove(medal)
+                self.watch_list.append(medal)
+                return False
 
             try:
                 await self.api.heartbeat(room_id, target_id)
@@ -354,81 +368,160 @@ class BiliUser:
 
             attempts += 1
             await asyncio.sleep(60)
-        
+    
+    async def _watch_task_wrapper(self, medal):
+        """ 在后台运行单个 watch_room，并在结束后根据返回值从 watch_list 中移除 medal。 保证：不论成功/失败/异常，都会将 self._current_watch_task 置为 None。 """
+        name = medal["anchor_info"]["nick_name"]
+        try:
+            ok = await self.watch_room(medal)
+            if ok:
+                # 如果 watch_room 成功，则把 medal 从 watch_list 中移除（若仍在列表中）
+                try:
+                    self.watch_list.remove(medal)
+                except ValueError: # 已经被移除则忽略
+                    pass
+            else:
+                # watch_room 返回 False 的情况下，watch_room 本身已经把 medal 放到队尾或记录了日志
+                pass
+        except asyncio.CancelledError:
+            self.log.info(f"{name} 的后台观看任务被取消")
+            raise
+        except Exception as e:
+            self.log.warning(f"{name} 的后台观看任务出现异常: {e}")
+        finally:
+            self._current_watch_task = None
+            self.log.info(f"{name} 后台观看任务结束，_current_watch_task 清空。")
 
     async def task_loop(self):
-        """按照直播状态与用户类型执行点赞/弹幕/观看任务"""
+        """按直播状态与用户类型执行点赞/弹幕任务，观看任务作为独立后台任务运行"""
         current_day = self._now_beijing().date()  # 记录初始日期
-        
-        while self.like_list or self.danmaku_list or self.watch_list:
-            # 每次循环检查是否跨天（北京时间）
+
+        async def like_danmaku_loop():
+            """点赞与弹幕任务循环，自动根据任务可执行状态调整频率"""
+            while self.like_list or self.danmaku_list:
+                some_task_attempted = False
+
+                # 点赞任务
+                for medal in self.like_list.copy():
+                    uid = medal["medal"]["target_id"]
+                    room_id = medal["room_info"]["room_id"]
+                    guard = medal["medal"]["guard_level"]
+
+                    try:
+                        status = await self.api.getRoomLiveStatus(room_id)
+                    except Exception as e:
+                        self.log.warning(f"{medal['anchor_info']['nick_name']} 获取房间开播状态失败: {e}")
+                        continue
+
+                    if status != 1:
+                        if guard > 0:
+                            self.log.info(f"{medal['anchor_info']['nick_name']} 未开播，点赞任务加入重试列表")
+                        continue
+
+                    some_task_attempted = True
+                    times = 10 if guard > 0 else 38
+                    await self.like_room(room_id, medal, times=times)
+
+                    try:
+                        self.like_list.remove(medal)
+                    except ValueError:
+                        pass
+                    self._mark_task_done(uid, "like")
+
+                    if guard == 0 and medal in self.danmaku_list:
+                        try:
+                            self.danmaku_list.remove(medal)
+                        except ValueError:
+                            pass
+                    self._mark_task_done(uid, "danmaku")
+
+                # 弹幕任务
+                for medal in self.danmaku_list.copy():
+                    uid = medal["medal"]["target_id"]
+                    room_id = medal["room_info"]["room_id"]
+                    guard = medal["medal"]["guard_level"]
+
+                    try:
+                        status = await self.api.getRoomLiveStatus(room_id)
+                    except Exception as e:
+                        self.log.warning(f"{medal['anchor_info']['nick_name']} 获取房间开播状态失败: {e}")
+                        continue
+
+                    if status == 1:
+                        if guard > 0:
+                            self.log.info(f"{medal['anchor_info']['nick_name']} 开播中，弹幕任务加入重试列表")
+                        continue
+
+                    some_task_attempted = True
+                    times = 5 if guard > 0 else 10
+                    await self.send_danmaku(room_id, medal, times=times)
+
+                    try:
+                        self.danmaku_list.remove(medal)
+                    except ValueError:
+                        pass
+                    self._mark_task_done(uid, "danmaku")
+
+                    if guard == 0 and medal in self.like_list:
+                        try:
+                            self.like_list.remove(medal)
+                        except ValueError:
+                            pass
+                        self._mark_task_done(uid, "like")
+
+                # 根据是否执行任务调整睡眠时间
+                if some_task_attempted:
+                    await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(600)  # 任务空闲时睡眠时间更长
+
+        async def watch_manager_loop():
+            """管理后台观看任务，始终独立运行"""
+            while self.watch_list or self._current_watch_task:
+                if self._current_watch_task is None and self.watch_list:
+                    try:
+                        watch_medal = await self.get_next_watchable(self.watch_list)
+                    except Exception as e:
+                        self.log.warning(f"选择可观看房间时出错: {e}")
+                        watch_medal = None
+
+                    if watch_medal:
+                        self.log.info(f"启动后台观看任务: {watch_medal['anchor_info']['nick_name']} (room: {watch_medal['room_info']['room_id']})")
+                        self._current_watch_task = asyncio.create_task(self._watch_task_wrapper(watch_medal))
+                await asyncio.sleep(10)  # 观看任务检查频率较低，减轻压力
+
+        while True:
             now_day = self._now_beijing().date()
             if now_day != current_day:
                 self.log.success(f"检测到北京时间已进入新的一天（{current_day} → {now_day}），正在重新执行任务……")
-                # 清理旧任务与日志
-                await self.session.close()
-                await asyncio.sleep(5)  # 稍等以防止接口频率过快
-                if self.api.session and not self.api.session.closed:
+                try:
+                    await self.session.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(5)
+                if getattr(self.api, "session", None) and not self.api.session.closed:
                     await self.api.session.close()
                 self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
-                await self.start()      # 重新启动整个流程
-                return                  # 结束旧循环
-            
-            # 1. 点赞任务（开播才做）
-            for medal in self.like_list.copy():
-                uid = medal["medal"]["target_id"]
-                room_id = medal["room_info"]["room_id"]
-                guard = medal["medal"]["guard_level"]
-                
-                status = await self.api.getRoomLiveStatus(room_id)
-                if status != 1:  # 0未开播，1直播，2轮播
-                    if guard>0:
-                        self.log.info(f"{medal['anchor_info']['nick_name']} 未开播，点赞任务加入重试列表")
-                    continue
+                await self.start()
+                return
 
-                times = 10 if guard > 0 else 36
-                await self.like_room(room_id, medal, times=times)
-
-                self.like_list.remove(medal)
-                self._mark_task_done(uid, "like")
-                if guard == 0 and medal in self.danmaku_list:
-                    self.danmaku_list.remove(medal)
-                    self._mark_task_done(uid, "danmaku")
-
-            # 2. 弹幕任务（未开播才做）
-            for medal in self.danmaku_list.copy():
-                uid = medal["medal"]["target_id"]
-                room_id = medal["room_info"]["room_id"]
-                guard = medal["medal"]["guard_level"]
-                
-                status = await self.api.getRoomLiveStatus(room_id)
-                if status == 1:  # 开播状态不发弹幕
-                    if guard>0:
-                        self.log.info(f"{medal['anchor_info']['nick_name']} 开播中，弹幕任务加入重试列表")
-                    continue
-
-                times = 5 if guard > 0 else 10
-                await self.send_danmaku(room_id, medal, times=times)
-
-                self.danmaku_list.remove(medal)
-                self._mark_task_done(uid, "danmaku")
-                if guard == 0 and medal in self.like_list:
-                    self.like_list.remove(medal)
-                    self._mark_task_done(uid, "like")
-
-            # 3. 观看任务
-            medal = await self.get_next_watchable(self.watch_list)
-
-            if medal:
-                ok = await self.watch_room(medal)
-                if ok:
-                    self.watch_list.remove(medal)
-            else:
-                # 没有可观看房间时，等待一会再重新检查
-                await asyncio.sleep(60)
-
-            if not (self.like_list or self.danmaku_list or self.watch_list):
+            # 同时运行点赞/弹幕循环和观看管理循环
+            if not (self.like_list or self.danmaku_list or self.watch_list or self._current_watch_task):
+                # 全部任务空闲且无后台观看，退出
                 break
+
+            # 启动并等待两个任务完成或超时（用wait_for限制单次循环最大耗时）
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(like_danmaku_loop(), watch_manager_loop()),
+                    timeout=60,  # 控制单次循环最大时长，避免长时间卡死
+                )
+            except asyncio.TimeoutError:
+                # 超时后继续循环，保证循环继续
+                pass
+
+        self.log.info("所有任务处理完成或已无可执行任务，task_loop 退出。")
+
             
             
     # ------------------------- 主流程控制 -------------------------
