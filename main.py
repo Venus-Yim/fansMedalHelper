@@ -1,14 +1,21 @@
+import sys
+
+MIN_PYTHON = (3, 10)
+if sys.version_info < MIN_PYTHON:
+    print(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} 及以上版本才支持本程序，当前版本: {sys.version_info.major}.{sys.version_info.minor}")
+    sys.exit(1)
+
 import json
 import os
-import sys
 from loguru import logger
 import warnings
 import asyncio
 import aiohttp
 from src import BiliUser
+from src.update_checker import check_update
 
 log = logger.bind(user="B站粉丝牌助手")
-__VERSION__ = "0.4.0"
+__VERSION__ = "2.0.2"
 
 warnings.filterwarnings(
     "ignore",
@@ -46,6 +53,7 @@ except Exception as e:
 async def main():
     messageList = []
     async with aiohttp.ClientSession(trust_env=True) as session:
+        check_update()
 #         try:
 #             log.warning("当前版本为: " + __VERSION__)
 #             resp = await (
@@ -157,4 +165,3 @@ if __name__ == "__main__":
     else:
         log.info("未配置定时器，开启单次任务。")
         run()
-
