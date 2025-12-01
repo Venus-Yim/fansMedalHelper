@@ -5,6 +5,7 @@ import os
 import uuid
 from loguru import logger
 from datetime import datetime, timedelta
+import time
 from collections import defaultdict
 import pytz
 import json
@@ -93,6 +94,7 @@ class BiliUser:
         self.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
         self.api = BiliApi(self, self.session)
         self._current_watch_task = None
+        self._retry_info = {}
 
         self.log = logger.bind(user=self.name or "未知用户", uid=self.uuids)
         self.log_file = f"logs/{self.uuids}.log"
@@ -393,16 +395,43 @@ class BiliUser:
             self.log.info(f"{name} 后台观看任务结束，_current_watch_task 清空。")
 
     async def task_loop(self):
-        """按直播状态与用户类型执行点赞/弹幕任务，观看任务作为独立后台任务运行"""
+        """按直播状态与用户类型执行点赞/弹幕任务，观看任务作为独立后台任务运行。
+        - 重试/重复日志以每 30 分钟为周期节流
+        - 不再使用 some_task_attempted，内部用 per-medal 的 next_check 控制请求频率
+        """
+
+        # 确保 retry state 已存在（在 __init__ 或 start() 中初始化也可以）
+        if not hasattr(self, "_retry_info"):
+            self._retry_info = {}
+
+        LOG_INTERVAL = 1800  # 重复日志间隔：30 分钟
+
         current_day = self._now_beijing().date()  # 记录初始日期
 
+        # ---------- 点赞/弹幕子循环 ----------
         async def like_danmaku_loop():
-            """点赞与弹幕任务循环，自动根据任务可执行状态调整频率"""
             while self.like_list or self.danmaku_list:
-                some_task_attempted = False
+                now = time.time()
 
-                # 点赞任务
+                def _key_for(medal):
+                    return f"{medal['medal']['target_id']}:{medal['room_info']['room_id']}"
+
+                def _ensure_state(key):
+                    st = self._retry_info.get(key)
+                    if st is None:
+                        st = {"next_check": 0.0, "last_log": 0.0, "fail_count": 0}
+                        self._retry_info[key] = st
+                    return st
+
+                # 点赞
                 for medal in self.like_list.copy():
+                    key = _key_for(medal)
+                    st = _ensure_state(key)
+
+                    # 跳过还未到下次检查时间的 medal
+                    if now < st["next_check"]:
+                        continue
+
                     uid = medal["medal"]["target_id"]
                     room_id = medal["room_info"]["room_id"]
                     guard = medal["medal"]["guard_level"]
@@ -410,33 +439,69 @@ class BiliUser:
                     try:
                         status = await self.api.getRoomLiveStatus(room_id)
                     except Exception as e:
-                        self.log.warning(f"{medal['anchor_info']['nick_name']} 获取房间开播状态失败: {e}")
+                        # 网络或 API 错误：指数退避，日志每 LOG_INTERVAL 打一次
+                        st["fail_count"] += 1
+                        backoff = min(LOG_INTERVAL, 2 ** min(st["fail_count"], 10))
+                        st["next_check"] = now + backoff
+                        if now - st["last_log"] > LOG_INTERVAL:
+                            st["last_log"] = now
+                            self.log.warning(f"{medal['anchor_info']['nick_name']} 获取房间开播状态失败: {e} （后续 {int(backoff)}s 内不再重试）")
                         continue
 
+                    # 非直播则不点赞：短退避，日志按 LOG_INTERVAL 节流
                     if status != 1:
-                        if guard > 0:
-                            self.log.info(f"{medal['anchor_info']['nick_name']} 未开播，点赞任务加入重试列表")
+                        st["fail_count"] += 1
+                        st["next_check"] = now + 60  # 状态不符合时短退避
+                        if st["fail_count"] == 1 or (now - st["last_log"] > LOG_INTERVAL):
+                            st["last_log"] = now
+                            if guard > 0:
+                                self.log.info(f"{medal['anchor_info']['nick_name']} 未开播，点赞任务加入重试列表")
                         continue
 
-                    some_task_attempted = True
-                    times = 10 if guard > 0 else 38
-                    await self.like_room(room_id, medal, times=times)
+                    # 真正执行点赞 —— 成功后移除 retry 状态并清理列表
+                    try:
+                        times = 10 if guard > 0 else 38
+                        await self.like_room(room_id, medal, times=times)
+                    except Exception as e:
+                        # 如果点赞内部失败，也按指数退避处理并节流日志
+                        st["fail_count"] += 1
+                        backoff = min(LOG_INTERVAL, 2 ** min(st["fail_count"], 10))
+                        st["next_check"] = now + backoff
+                        if now - st["last_log"] > LOG_INTERVAL:
+                            st["last_log"] = now
+                            self.log.warning(f"{medal['anchor_info']['nick_name']} 点赞失败: {e} （后续 {int(backoff)}s 内不再重试）")
+                        continue
 
+                    # 点赞成功：移除 medal，标记完成，清理 retry state
                     try:
                         self.like_list.remove(medal)
                     except ValueError:
                         pass
                     self._mark_task_done(uid, "like")
+                    # 清理 retry info
+                    if key in self._retry_info:
+                        del self._retry_info[key]
 
+                    # 如果是非大航海，并且也在弹幕列表中，则移除弹幕任务
                     if guard == 0 and medal in self.danmaku_list:
                         try:
                             self.danmaku_list.remove(medal)
                         except ValueError:
                             pass
-                    self._mark_task_done(uid, "danmaku")
+                        self._mark_task_done(uid, "danmaku")
+                        # 也清理弹幕对应的 retry state（防止残留）
+                        key_dm = f"{uid}:{medal['room_info']['room_id']}"
+                        if key_dm in self._retry_info:
+                            del self._retry_info[key_dm]
 
-                # 弹幕任务
+                # 弹幕
                 for medal in self.danmaku_list.copy():
+                    key = _key_for(medal)
+                    st = _ensure_state(key)
+
+                    if now < st["next_check"]:
+                        continue
+
                     uid = medal["medal"]["target_id"]
                     room_id = medal["room_info"]["room_id"]
                     guard = medal["medal"]["guard_level"]
@@ -444,23 +509,45 @@ class BiliUser:
                     try:
                         status = await self.api.getRoomLiveStatus(room_id)
                     except Exception as e:
-                        self.log.warning(f"{medal['anchor_info']['nick_name']} 获取房间开播状态失败: {e}")
+                        st["fail_count"] += 1
+                        backoff = min(LOG_INTERVAL, 2 ** min(st["fail_count"], 10))
+                        st["next_check"] = now + backoff
+                        if now - st["last_log"] > LOG_INTERVAL:
+                            st["last_log"] = now
+                            self.log.warning(f"{medal['anchor_info']['nick_name']} 获取房间开播状态失败: {e} （后续 {int(backoff)}s 内不再重试）")
                         continue
 
+                    # 如果正在直播则不发弹幕，短退避并按 LOG_INTERVAL 节流日志
                     if status == 1:
-                        if guard > 0:
-                            self.log.info(f"{medal['anchor_info']['nick_name']} 开播中，弹幕任务加入重试列表")
+                        st["fail_count"] += 1
+                        st["next_check"] = now + 60
+                        if st["fail_count"] == 1 or (now - st["last_log"] > LOG_INTERVAL):
+                            st["last_log"] = now
+                            if guard > 0:
+                                self.log.info(f"{medal['anchor_info']['nick_name']} 开播中，弹幕任务加入重试列表")
                         continue
 
-                    some_task_attempted = True
-                    times = 5 if guard > 0 else 10
-                    await self.send_danmaku(room_id, medal, times=times)
+                    # 真正执行弹幕
+                    try:
+                        times = 5 if guard > 0 else 10
+                        await self.send_danmaku(room_id, medal, times=times)
+                    except Exception as e:
+                        st["fail_count"] += 1
+                        backoff = min(LOG_INTERVAL, 2 ** min(st["fail_count"], 10))
+                        st["next_check"] = now + backoff
+                        if now - st["last_log"] > LOG_INTERVAL:
+                            st["last_log"] = now
+                            self.log.warning(f"{medal['anchor_info']['nick_name']} 发送弹幕失败: {e} （后续 {int(backoff)}s 内不再重试）")
+                        continue
 
+                    # 弹幕成功：移除 medal，标记完成，清理 retry state
                     try:
                         self.danmaku_list.remove(medal)
                     except ValueError:
                         pass
                     self._mark_task_done(uid, "danmaku")
+                    if key in self._retry_info:
+                        del self._retry_info[key]
 
                     if guard == 0 and medal in self.like_list:
                         try:
@@ -468,15 +555,16 @@ class BiliUser:
                         except ValueError:
                             pass
                         self._mark_task_done(uid, "like")
+                        # 清理对应的 like retry state
+                        key_like = f"{uid}:{medal['room_info']['room_id']}"
+                        if key_like in self._retry_info:
+                            del self._retry_info[key_like]
 
-                # 根据是否执行任务调整睡眠时间
-                if some_task_attempted:
-                    await asyncio.sleep(1)
-                else:
-                    await asyncio.sleep(600)  # 任务空闲时睡眠时间更长
+                # Per-medal 控制已经大幅减少重复查询与日志，因此 sleep 可以较短，保证对 watch 的响应性
+                await asyncio.sleep(5)
 
+        # ---------- 观看管理子循环 ----------
         async def watch_manager_loop():
-            """管理后台观看任务，始终独立运行"""
             while self.watch_list or self._current_watch_task:
                 if self._current_watch_task is None and self.watch_list:
                     try:
@@ -488,9 +576,12 @@ class BiliUser:
                     if watch_medal:
                         self.log.info(f"启动后台观看任务: {watch_medal['anchor_info']['nick_name']} (room: {watch_medal['room_info']['room_id']})")
                         self._current_watch_task = asyncio.create_task(self._watch_task_wrapper(watch_medal))
-                await asyncio.sleep(10)  # 观看任务检查频率较低，减轻压力
 
+                await asyncio.sleep(10)
+
+        # ---------- 主循环：跨天检查 + 启动/管理子任务 ----------
         while True:
+            # 跨天检测
             now_day = self._now_beijing().date()
             if now_day != current_day:
                 self.log.success(f"检测到北京时间已进入新的一天（{current_day} → {now_day}），正在重新执行任务……")
@@ -503,22 +594,30 @@ class BiliUser:
                     await self.api.session.close()
                 self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
                 await self.start()
-                return
+                return  # 结束旧循环
 
-            # 同时运行点赞/弹幕循环和观看管理循环
+            # 全部任务空闲且无后台观看，退出
             if not (self.like_list or self.danmaku_list or self.watch_list or self._current_watch_task):
-                # 全部任务空闲且无后台观看，退出
                 break
 
-            # 启动并等待两个任务完成或超时（用wait_for限制单次循环最大耗时）
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(like_danmaku_loop(), watch_manager_loop()),
-                    timeout=60,  # 控制单次循环最大时长，避免长时间卡死
-                )
-            except asyncio.TimeoutError:
-                # 超时后继续循环，保证循环继续
-                pass
+            # 启动子任务（如果尚未启动）
+            if not hasattr(self, "_like_task") or self._like_task.done():
+                self._like_task = asyncio.create_task(like_danmaku_loop())
+            if not hasattr(self, "_watch_manager_task") or self._watch_manager_task.done():
+                self._watch_manager_task = asyncio.create_task(watch_manager_loop())
+
+            # 主循环短睡以便周期性检查（如跨天），并不影响后台 watch task
+            await asyncio.sleep(5)
+
+        # 退出前尝试取消仍在运行的子任务（若有）
+        for tname in ("_like_task", "_watch_manager_task"):
+            task = getattr(self, tname, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         self.log.info("所有任务处理完成或已无可执行任务，task_loop 退出。")
 
