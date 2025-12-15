@@ -43,6 +43,7 @@ try:
         "WATCH_MAX_ATTEMPTS": users["WATCH_MAX_ATTEMPTS"],
         "WEARMEDAL": users["WEARMEDAL"],
         "PROXY": users.get("PROXY"),
+        "CRON": users.get("CRON"),
     }
 except Exception as e:
     log.error(f"读取配置文件失败，请检查格式是否正确: {e}")
@@ -95,25 +96,35 @@ async def main():
         except Exception as e:
             log.exception(e)
             messageList.append(f"任务执行失败: {e}")
+        
+        if not messageList:
+            messageList.append("任务执行完成（无异常）")
 
         # ------------------------------
         # 消息推送
         # ------------------------------
         if users.get("SENDKEY", ""):
             await push_message(session, users["SENDKEY"], "  \n".join(messageList))
-
+        
         if users.get("MOREPUSH", ""):
             from onepush import notify
             notifier = users["MOREPUSH"]["notifier"]
             params = users["MOREPUSH"]["params"]
-            await notify(
-                notifier,
-                title=f"【B站粉丝牌助手推送】",
-                content="  \n".join(messageList),
-                **params,
-                proxy=config.get("PROXY"),
-            )
-            log.info(f"{notifier} 已推送")
+
+            content = "  \n".join(messageList)
+            log.info(f"准备推送 {notifier}，内容长度={len(content)}")
+
+            try:
+                resp = await notify(
+                    notifier,
+                    title="【B站粉丝牌助手推送】",
+                    content=content,
+                    **params,
+                    proxy=config.get("PROXY"),
+                )
+                log.info(f"{notifier} notify 调用完成，resp={resp}")
+            except Exception as e:
+                log.error(f"{notifier} 推送异常: {e}")
 
     log.info("所有任务执行完成。")
 
@@ -139,29 +150,63 @@ if __name__ == "__main__":
     cron = users.get("CRON", None)
 
     if cron:
-#         from apscheduler.schedulers.blocking import BlockingScheduler
-#         from apscheduler.triggers.cron import CronTrigger
-# 
-#         log.info(f"使用内置定时器 {cron}，开启定时任务。")
-#         scheduler = BlockingScheduler()
-#         scheduler.add_job(run, CronTrigger.from_crontab(cron), misfire_grace_time=3600)
-#         scheduler.start()
-        log.info("已配置定时器，开启循环任务。")
-        run()
-    elif "--auto" in sys.argv:
         from apscheduler.schedulers.blocking import BlockingScheduler
-        from apscheduler.triggers.interval import IntervalTrigger
+        from apscheduler.triggers.cron import CronTrigger
         import datetime
 
-        log.info("使用自动守护模式，每隔 24 小时运行一次。")
+        log.info(f"使用内置定时器 {cron}，开启定时任务。")
         scheduler = BlockingScheduler(timezone="Asia/Shanghai")
+
+        # 定时 CRON
         scheduler.add_job(
             run,
-            IntervalTrigger(hours=24),
+            CronTrigger.from_crontab(cron, timezone="Asia/Shanghai"),
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
+        # 启动时由 scheduler 触发一次立即执行
+        scheduler.add_job(
+            run,
             next_run_time=datetime.datetime.now(),
             misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
         )
+
         scheduler.start()
+        log.info("已配置定时器，开启循环任务。")
+
+    elif "--auto" in sys.argv:
+        from apscheduler.schedulers.blocking import BlockingScheduler
+        from apscheduler.triggers.cron import CronTrigger
+        import datetime
+
+        log.info("使用自动守护模式：启动时立即执行一次，并在每天 00:02 自动运行。")
+
+        scheduler = BlockingScheduler(timezone="Asia/Shanghai")
+
+        # 每天 00:02 执行
+        scheduler.add_job(
+            run,
+            CronTrigger(hour=0, minute=2, timezone="Asia/Shanghai"),
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
+        # 启动时由 scheduler 触发一次立即执行
+        scheduler.add_job(
+            run,
+            next_run_time=datetime.datetime.now(),
+            misfire_grace_time=3600,
+            max_instances=1,
+            coalesce=True,
+        )
+
+        scheduler.start()
+
     else:
         log.info("未配置定时器，开启单次任务。")
         run()
