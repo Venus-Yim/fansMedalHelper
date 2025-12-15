@@ -639,7 +639,7 @@ class BiliUser:
 
     async def start(self):
         """启动任务：初始化本地日志记录→登录→获取勋章列表→循环执行点赞/弹幕/观看
-        start 会在跨天触发时立即重新开始（即时重启到新的一天）；若配置 CRON 则在任务完成后按 CRON 等待下一次执行。
+        start 会在跨天触发（任务未全部执行完成）时立即重新开始（即时重启到新的一天）；若任务全部执行完成，则交由main根据 CRON 配置情况进行跨天重启。
         """
         from aiohttp import ClientSession, ClientTimeout
         from croniter import croniter
@@ -691,10 +691,9 @@ class BiliUser:
                         await self.api.session.close()
                 except Exception:
                     pass
-                # 重置一些状态以确保干净重启（可根据需要扩展）
-                self._current_watch_task = None
-                # 继续循环以重新进行 login/get_medals 等
-                continue
+                
+                self.log.info("检测到跨天，已退出以等待外部调度器/下一次 run() 触发新任务。")
+                return
 
             # 否则，任务为“正常完成”——关闭 session 并根据 CRON 决定是否等待重启
             self.log.success("所有任务执行完成")
@@ -704,24 +703,5 @@ class BiliUser:
             except Exception:
                 pass
 
-            cron = self.config.get("CRON", None)
-            if cron:
-                # 等待到下一次 cron 时间再重启
-                base_time = self._now_beijing()
-                cron_iter = croniter(cron, base_time)
-                next_run_time = cron_iter.get_next(datetime)
-                sleep_seconds = (next_run_time - base_time).total_seconds()
-                self.log.info(f"等待至北京时间 {next_run_time.strftime('%Y-%m-%d %H:%M:%S')} 自动开始新任务（约 {sleep_seconds/3600:.2f} 小时）")
-                await asyncio.sleep(sleep_seconds)
-
-                # 重新建立 session，循环继续以重启任务
-                try:
-                    if getattr(self.api, "session", None) and not self.api.session.closed:
-                        await self.api.session.close()
-                except Exception:
-                    pass
-                continue
-            else:
-                # 无 CRON，正常结束
-                return
+            return
 
