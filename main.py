@@ -153,6 +153,7 @@ if __name__ == "__main__":
         from apscheduler.schedulers.blocking import BlockingScheduler
         from apscheduler.triggers.cron import CronTrigger
         import datetime
+        from zoneinfo import ZoneInfo
 
         log.info(f"使用内置定时器 {cron}，开启定时任务。")
         scheduler = BlockingScheduler(timezone="Asia/Shanghai")
@@ -169,7 +170,7 @@ if __name__ == "__main__":
         # 启动时由 scheduler 触发一次立即执行
         scheduler.add_job(
             run,
-            next_run_time=datetime.datetime.now(),
+            next_run_time=datetime.datetime.now(ZoneInfo("Asia/Shanghai")),
             misfire_grace_time=3600,
             max_instances=1,
             coalesce=True,
@@ -182,6 +183,7 @@ if __name__ == "__main__":
         from apscheduler.schedulers.blocking import BlockingScheduler
         from apscheduler.triggers.cron import CronTrigger
         import datetime
+        from zoneinfo import ZoneInfo
 
         log.info("使用自动守护模式：启动时立即执行一次，并在每天 00:02 自动运行。")
 
@@ -199,7 +201,7 @@ if __name__ == "__main__":
         # 启动时由 scheduler 触发一次立即执行
         scheduler.add_job(
             run,
-            next_run_time=datetime.datetime.now(),
+            next_run_time=datetime.datetime.now(ZoneInfo("Asia/Shanghai")),
             misfire_grace_time=3600,
             max_instances=1,
             coalesce=True,
