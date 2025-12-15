@@ -5,6 +5,7 @@ import os
 import uuid
 from loguru import logger
 from datetime import datetime, timedelta
+from croniter import croniter
 import time
 from collections import defaultdict
 import pytz
@@ -94,7 +95,8 @@ class BiliUser:
         self.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
         self.api = BiliApi(self, self.session)
         self._current_watch_task = None
-        self._retry_info = {}
+        self._retry_info_like = {}
+        self._retry_info_danmaku = {}
 
         self.log = logger.bind(user=self.name or "未知用户", uid=self.uuids)
         self.log_file = f"logs/{self.uuids}.log"
@@ -208,9 +210,9 @@ class BiliUser:
 
         for medal in self.medals:
             uid = medal["medal"]["target_id"]
-            if like_cd and uid not in logs.get("like", []) and (medal['medal']['is_lighted']==0 or medal["medal"]["guard_level"]>0):
+            if like_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "like") and medal["medal"]["guard_level"]>0)):
                 self.like_list.append(medal)
-            if danmaku_cd and uid not in logs.get("danmaku", [])  and (medal['medal']['is_lighted']==0 or medal["medal"]["guard_level"]>0):
+            if danmaku_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "danmaku") and medal["medal"]["guard_level"]>0)):
                 self.danmaku_list.append(medal)
             if watch_cd:
                 try:
@@ -222,16 +224,11 @@ class BiliUser:
             
         self.log.success(f"任务列表共 {len(self.medals)} 个粉丝牌(待点赞: {len(self.like_list)}, 待弹幕: {len(self.danmaku_list)}, 待观看: {len(self.watch_list)})\n")
 
-
     # ------------------------- 点赞任务 -------------------------
     async def like_room(self, room_id, medal, times=5):
         name = medal["anchor_info"]["nick_name"]
         success_count = 0
         target_id = medal["medal"]["target_id"]
-        
-        if self._is_task_done(target_id, "like"):
-            self.log.info(f"{name} 点赞任务已完成，跳过。")
-            return
         
         for i in range(times):
             fail_count = 0
@@ -263,10 +260,6 @@ class BiliUser:
         target_id = medal["medal"]["target_id"]
         success_count = 0
         cd = self.config.get("DANMAKU_CD", 3)  # 弹幕间隔，可在 users.yaml 调整
-
-        if self._is_task_done(target_id, "danmaku"):
-            self.log.info(f"{name} 弹幕任务已完成，跳过。")
-            return
 
         for i in range(times):
             fail_count = 0
@@ -393,40 +386,69 @@ class BiliUser:
         finally:
             self._current_watch_task = None
             self.log.info(f"{name} 后台观看任务结束，_current_watch_task 清空。")
-
+    
     async def task_loop(self):
         """按直播状态与用户类型执行点赞/弹幕任务，观看任务作为独立后台任务运行。
-        - 重试/重复日志以每 30 分钟为周期节流
-        - 不再使用 some_task_attempted，内部用 per-medal 的 next_check 控制请求频率
+        - 重试/重复日志以每 30 分钟为周期节流（由上层 retry_info 控制）
+        - 使用独立 day_change_watcher 通过事件通知实现跨天重启
         """
-
-        # 确保 retry state 已存在（在 __init__ 或 start() 中初始化也可以）
+        # 确保 retry state 已存在
         if not hasattr(self, "_retry_info"):
             self._retry_info = {}
 
         LOG_INTERVAL = 1800  # 重复日志间隔：30 分钟
 
-        current_day = self._now_beijing().date()  # 记录初始日期
+        # day change event：由 watcher 设置，start() 会根据这个事件决定是否重启
+        self._day_changed_event = asyncio.Event()
+
+        # ---------- 跨天监测子任务 ----------
+        async def day_change_watcher():
+            current_day = self._now_beijing().date()
+            while True:
+                await asyncio.sleep(5)
+                now_day = self._now_beijing().date()
+                if now_day != current_day:
+                    self.log.success(f"检测到北京时间已进入新的一天（{current_day} → {now_day}），准备重新执行任务……")
+                    # 标记跨天事件，由上层 start() 处理重启流程
+                    self._day_changed_event.set()
+                    return
 
         # ---------- 点赞/弹幕子循环 ----------
         async def like_danmaku_loop():
+            # 将点赞和弹幕的 retry state 分开保存，避免相互覆盖和冲突
+            if not hasattr(self, "_retry_info_like"):
+                self._retry_info_like = {}
+            if not hasattr(self, "_retry_info_danmaku"):
+                self._retry_info_danmaku = {}
+
             while self.like_list or self.danmaku_list:
+                
                 now = time.time()
 
                 def _key_for(medal):
                     return f"{medal['medal']['target_id']}:{medal['room_info']['room_id']}"
 
-                def _ensure_state(key):
-                    st = self._retry_info.get(key)
-                    if st is None:
-                        st = {"next_check": 0.0, "last_log": 0.0, "fail_count": 0}
-                        self._retry_info[key] = st
-                    return st
-
+                def _ensure_state(key, kind: str):
+                    """
+                    kind: 'like' 或 'danmaku'
+                    """
+                    if kind == "like":
+                        st = self._retry_info_like.get(key)
+                        if st is None:
+                            st = {"next_check": 0.0, "last_log": 0.0, "fail_count": 0}
+                            self._retry_info_like[key] = st
+                        return st
+                    else:
+                        st = self._retry_info_danmaku.get(key)
+                        if st is None:
+                            st = {"next_check": 0.0, "last_log": 0.0, "fail_count": 0}
+                            self._retry_info_danmaku[key] = st
+                        return st
+                
                 # 点赞
                 for medal in self.like_list.copy():
                     key = _key_for(medal)
-                    st = _ensure_state(key)
+                    st = _ensure_state(key, "like")
 
                     # 跳过还未到下次检查时间的 medal
                     if now < st["next_check"]:
@@ -472,15 +494,14 @@ class BiliUser:
                             self.log.warning(f"{medal['anchor_info']['nick_name']} 点赞失败: {e} （后续 {int(backoff)}s 内不再重试）")
                         continue
 
-                    # 点赞成功：移除 medal，标记完成，清理 retry state
+                    # 点赞成功：移除 medal，标记完成，清理 like 的 retry state
                     try:
                         self.like_list.remove(medal)
                     except ValueError:
                         pass
                     self._mark_task_done(uid, "like")
-                    # 清理 retry info
-                    if key in self._retry_info:
-                        del self._retry_info[key]
+                    if key in self._retry_info_like:
+                        del self._retry_info_like[key]
 
                     # 如果是非大航海，并且也在弹幕列表中，则移除弹幕任务
                     if guard == 0 and medal in self.danmaku_list:
@@ -489,19 +510,18 @@ class BiliUser:
                         except ValueError:
                             pass
                         self._mark_task_done(uid, "danmaku")
-                        # 也清理弹幕对应的 retry state（防止残留）
-                        key_dm = f"{uid}:{medal['room_info']['room_id']}"
-                        if key_dm in self._retry_info:
-                            del self._retry_info[key_dm]
-
+                        # 清理对应 danmaku retry state
+                        if key in self._retry_info_danmaku:
+                            del self._retry_info_danmaku[key]
+                
                 # 弹幕
                 for medal in self.danmaku_list.copy():
                     key = _key_for(medal)
-                    st = _ensure_state(key)
+                    st = _ensure_state(key, "danmaku")
 
                     if now < st["next_check"]:
                         continue
-
+                    
                     uid = medal["medal"]["target_id"]
                     room_id = medal["room_info"]["room_id"]
                     guard = medal["medal"]["guard_level"]
@@ -516,7 +536,7 @@ class BiliUser:
                             st["last_log"] = now
                             self.log.warning(f"{medal['anchor_info']['nick_name']} 获取房间开播状态失败: {e} （后续 {int(backoff)}s 内不再重试）")
                         continue
-
+                    
                     # 如果正在直播则不发弹幕，短退避并按 LOG_INTERVAL 节流日志
                     if status == 1:
                         st["fail_count"] += 1
@@ -526,7 +546,7 @@ class BiliUser:
                             if guard > 0:
                                 self.log.info(f"{medal['anchor_info']['nick_name']} 开播中，弹幕任务加入重试列表")
                         continue
-
+                    
                     # 真正执行弹幕
                     try:
                         times = 5 if guard > 0 else 10
@@ -539,15 +559,15 @@ class BiliUser:
                             st["last_log"] = now
                             self.log.warning(f"{medal['anchor_info']['nick_name']} 发送弹幕失败: {e} （后续 {int(backoff)}s 内不再重试）")
                         continue
-
-                    # 弹幕成功：移除 medal，标记完成，清理 retry state
+                    
+                    # 弹幕成功：移除 medal，标记完成，清理 danmaku 的 retry state
                     try:
                         self.danmaku_list.remove(medal)
                     except ValueError:
                         pass
                     self._mark_task_done(uid, "danmaku")
-                    if key in self._retry_info:
-                        del self._retry_info[key]
+                    if key in self._retry_info_danmaku:
+                        del self._retry_info_danmaku[key]
 
                     if guard == 0 and medal in self.like_list:
                         try:
@@ -555,13 +575,13 @@ class BiliUser:
                         except ValueError:
                             pass
                         self._mark_task_done(uid, "like")
-                        # 清理对应的 like retry state
-                        key_like = f"{uid}:{medal['room_info']['room_id']}"
-                        if key_like in self._retry_info:
-                            del self._retry_info[key_like]
+                        # 清理对应 like retry state
+                        if key in self._retry_info_like:
+                            del self._retry_info_like[key]
 
-                # Per-medal 控制已经大幅减少重复查询与日志，因此 sleep 可以较短，保证对 watch 的响应性
+                # Per-medal 控制已经大幅减少重复查询与日志，因此短 sleep 足够
                 await asyncio.sleep(5)
+
 
         # ---------- 观看管理子循环 ----------
         async def watch_manager_loop():
@@ -579,95 +599,129 @@ class BiliUser:
 
                 await asyncio.sleep(10)
 
-        # ---------- 主循环：跨天检查 + 启动/管理子任务 ----------
-        while True:
-            # 跨天检测
-            now_day = self._now_beijing().date()
-            if now_day != current_day:
-                self.log.success(f"检测到北京时间已进入新的一天（{current_day} → {now_day}），正在重新执行任务……")
-                try:
-                    await self.session.close()
-                except Exception:
-                    pass
+        # ---------- 启动并管理子任务 ----------
+        # 启动 day watcher
+        if not hasattr(self, "_day_watch_task") or self._day_watch_task.done():
+            self._day_watch_task = asyncio.create_task(day_change_watcher())
+
+        # 循环检查子任务与退出条件（当 day change 触发或任务全部完成时退出）
+        try:
+            while True:
+                # 若跨天事件触发，立即中止循环以便上层 start() 进行重启
+                if getattr(self, "_day_changed_event", None) and self._day_changed_event.is_set():
+                    break
+
+                # 全部任务空闲且无后台观看，退出
+                if not (self.like_list or self.danmaku_list or self.watch_list or self._current_watch_task):
+                    break
+
+                # 启动点赞/弹幕与 watch 管理子任务（如果尚未启动或已结束）
+                if not hasattr(self, "_like_task") or self._like_task.done():
+                    self._like_task = asyncio.create_task(like_danmaku_loop())
+                if not hasattr(self, "_watch_manager_task") or self._watch_manager_task.done():
+                    self._watch_manager_task = asyncio.create_task(watch_manager_loop())
+
+                # 主循环短睡以便周期性检查（如跨天），并不影响后台 watch task
                 await asyncio.sleep(5)
-                if getattr(self.api, "session", None) and not self.api.session.closed:
-                    await self.api.session.close()
-                self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
-                await self.start()
-                return  # 结束旧循环
+        finally:
+            # 退出前尝试取消仍在运行的子任务（若有）
+            for tname in ("_like_task", "_watch_manager_task", "_day_watch_task"):
+                task = getattr(self, tname, None)
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
 
-            # 全部任务空闲且无后台观看，退出
-            if not (self.like_list or self.danmaku_list or self.watch_list or self._current_watch_task):
-                break
+        self.log.info("task_loop 退出。")
+        return
 
-            # 启动子任务（如果尚未启动）
-            if not hasattr(self, "_like_task") or self._like_task.done():
-                self._like_task = asyncio.create_task(like_danmaku_loop())
-            if not hasattr(self, "_watch_manager_task") or self._watch_manager_task.done():
-                self._watch_manager_task = asyncio.create_task(watch_manager_loop())
-
-            # 主循环短睡以便周期性检查（如跨天），并不影响后台 watch task
-            await asyncio.sleep(5)
-
-        # 退出前尝试取消仍在运行的子任务（若有）
-        for tname in ("_like_task", "_watch_manager_task"):
-            task = getattr(self, tname, None)
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        self.log.info("所有任务处理完成或已无可执行任务，task_loop 退出。")
-
-            
-            
-    # ------------------------- 主流程控制 -------------------------
     async def start(self):
-        """启动任务：初始化本地日志记录→登录→获取勋章列表→循环执行点赞/弹幕/观看"""
+        """启动任务：初始化本地日志记录→登录→获取勋章列表→循环执行点赞/弹幕/观看
+        start 会在跨天触发时立即重新开始（即时重启到新的一天）；若配置 CRON 则在任务完成后按 CRON 等待下一次执行。
+        """
+        from aiohttp import ClientSession, ClientTimeout
+        from croniter import croniter
+        from datetime import datetime
+
+        # 清理旧日志
         self._clean_old_logs()
 
-        # 登录验证
-        if not self.api.session or self.api.session.closed:
-            self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
-        if not await self.loginVerify():
-            await self.session.close()
-            return
+        # 循环直到不需要继续（由跨天/CRON 决定）
+        while True:
+            # 建立 session（若无）
+            if not getattr(self.api, "session", None) or self.api.session.closed:
+                self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
 
-        # 获取勋章列表
-        await self.get_medals()
-        if not self.medals:
-            self.log.info("没有可执行任务的粉丝牌")
-            await self.session.close()
-            return
+            # 登录验证
+            if not await self.loginVerify():
+                try:
+                    if getattr(self, "session", None) and not self.session.closed:
+                        await self.session.close()
+                except Exception:
+                    pass
+                return
 
-        self.log.info(f"开始执行任务：")
+            # 获取勋章列表
+            await self.get_medals()
+            if not self.medals:
+                self.log.info("没有可执行任务的粉丝牌")
+                try:
+                    if getattr(self, "session", None) and not self.session.closed:
+                        await self.session.close()
+                except Exception:
+                    pass
+                return
 
-        # 循环执行点赞→弹幕→观看
-        await self.task_loop()
+            # 初始化 retry info（若尚未）
+            if not hasattr(self, "_retry_info"):
+                self._retry_info = {}
 
-        self.log.success("所有任务执行完成")
-        await self.session.close()
-        
-        # ---- 等待到下一天后自动重启 ----
-        cron = self.config.get("CRON", None)
-        if cron:
-            base_time = self._now_beijing()
-            cron_iter = croniter(cron, base_time)
-            next_run_time = cron_iter.get_next(datetime)
+            self.log.info("开始执行任务：")
 
-            sleep_seconds = (next_run_time - base_time).total_seconds()
-            self.log.info(f"等待至北京时间 {next_run_time.strftime('%Y-%m-%d %H:%M:%S')} 自动开始新任务（约 {sleep_seconds/3600:.2f} 小时）")
+            # 调用主循环（阻塞直到任务完成或跨天事件触发）
+            await self.task_loop()
 
-            await asyncio.sleep(sleep_seconds)
-            
-            if self.api.session and not self.api.session.closed:
-                await self.api.session.close()
-            self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
+            # 如果是跨天触发，立即重新开始（无需等待 CRON）
+            if getattr(self, "_day_changed_event", None) and self._day_changed_event.is_set():
+                # 清理旧 session 并立即重启新一天的任务流程
+                try:
+                    if getattr(self.api, "session", None) and not self.api.session.closed:
+                        await self.api.session.close()
+                except Exception:
+                    pass
+                # 重置一些状态以确保干净重启（可根据需要扩展）
+                self._current_watch_task = None
+                # 继续循环以重新进行 login/get_medals 等
+                continue
+
+            # 否则，任务为“正常完成”——关闭 session 并根据 CRON 决定是否等待重启
+            self.log.success("所有任务执行完成")
             try:
-                await self.start()
-            except Exception as e:
-                self.log.error(f"主任务执行出错：{e}")
-                await asyncio.sleep(60)
-                await self.start()
+                if getattr(self.api, "session", None) and not self.api.session.closed:
+                    await self.api.session.close()
+            except Exception:
+                pass
+
+            cron = self.config.get("CRON", None)
+            if cron:
+                # 等待到下一次 cron 时间再重启
+                base_time = self._now_beijing()
+                cron_iter = croniter(cron, base_time)
+                next_run_time = cron_iter.get_next(datetime)
+                sleep_seconds = (next_run_time - base_time).total_seconds()
+                self.log.info(f"等待至北京时间 {next_run_time.strftime('%Y-%m-%d %H:%M:%S')} 自动开始新任务（约 {sleep_seconds/3600:.2f} 小时）")
+                await asyncio.sleep(sleep_seconds)
+
+                # 重新建立 session，循环继续以重启任务
+                try:
+                    if getattr(self.api, "session", None) and not self.api.session.closed:
+                        await self.api.session.close()
+                except Exception:
+                    pass
+                continue
+            else:
+                # 无 CRON，正常结束
+                return
+
