@@ -120,9 +120,9 @@ def retry(tries=60, interval=1):
                     count += 1
                     tb = traceback.format_exc()
                     # 打印到控制台
-                    # print(f"[RETRY] exception in {func.__name__}: {e}\nTraceback:\n{tb}", flush=True)
+                    #print(f"[RETRY] exception in {func.__name__}: {e}\nTraceback:\n{tb}", flush=True)
                     # 也用 loguru 记录
-                    # log.error(f"Exception in {func.__name__}: {e}\n{tb}")
+                    #log.error(f"Exception in {func.__name__}: {e}\n{tb}")
                     # 特殊处理 BiliApiError 
                     if type(e) == BiliApiError:
                         if e.code == 1011040:
@@ -513,7 +513,7 @@ class BiliApi:
         return await self.__post(url, data=SingableDict(data).signed, headers=self.headers)
     
     @retry()
-    async def signIn(self, ruid: int, activity_id: int = 109745):
+    async def signIn(self, ruid: int, room_id: int, activity_id: int = 109745):
 
         url = "https://api.live.bilibili.com/xlive/custom-activity-interface/baseActivity/DoSignIn"
 
@@ -543,10 +543,10 @@ class BiliApi:
             "platform": "web",
             "csrf": csrf
         }
-
+        
         headers = {
             "Origin": "https://live.bilibili.com",
-            "Referer": f"https://live.bilibili.com/{ruid}",
+            "Referer": f"https://live.bilibili.com/{room_id}",
             "User-Agent": self.headers["User-Agent"],
             "Content-Type": "application/x-www-form-urlencoded",
         }

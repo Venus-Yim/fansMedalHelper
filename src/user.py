@@ -163,9 +163,10 @@ class BiliUser:
     def _mark_task_done(self, uid, task_type):
         logs = self._load_log()
         today = self._now_beijing().strftime("%Y-%m-%d")
-        logs.setdefault(today, {}).setdefault(task_type, []).append(uid)
-        self._save_log(logs)
-    
+        logs.setdefault(today, {}).setdefault(task_type, [])
+        if uid not in logs[today][task_type]:
+            logs[today][task_type].append(uid)
+            self._save_log(logs)
     
     # ------------------------- 登录与初始化 -------------------------
     async def loginVerify(self):
@@ -244,18 +245,19 @@ class BiliUser:
                         self.watch_list.append(medal)
                 except Exception as e:
                     self.log.warning(f"{medal['anchor_info']['nick_name']} 获取直播状态失败: {e}")
-            if signin_on == 2:
+            if signin_on == 2 and not self._is_task_done(uid, "sign"):
                 self.sign_list.append(medal)
         
         if signin_on == 1:
             for uid, medal in all_medals.items():
-                if uid not in self.bannedList:
+                if uid not in self.bannedList and not self._is_task_done(uid, "sign"):
                     self.sign_list.append(medal)
                 
                     
-        self.log.error(f"因b站接口更新，点赞模块暂不可用，此功能临时关闭，请关注本项目后续更新。受影响功能有：1.大航海每日开播自动点赞；2.非大航海开播期间自动点亮。")
         self.log.success(f"任务列表共 {len(self.medals)} 个粉丝牌(待点赞: {len(self.like_list)}, 待弹幕: {len(self.danmaku_list)}, 待观看: {len(self.watch_list)}, 待签到: {len(self.sign_list)})\n")
-
+        self.log.error(f"因b站接口更新，原点赞模块参数不再适配，会触发-352错误。此功能临时关闭，请关注本项目后续更新。受影响功能有：1.大航海每日开播自动点赞；2.非大航海开播期间自动点亮。")
+        
+        
     # ------------------------- 点赞任务 -------------------------
     async def like_room(self, room_id, medal, times=5):
         name = medal["anchor_info"]["nick_name"]
@@ -618,35 +620,56 @@ class BiliUser:
         
         # ---------- 活动签到子循环 ----------
         async def sign_in_loop():
+            self.fail_count=0
             while self.sign_list:
                 for medal in self.sign_list.copy():
                     uid = medal["medal"]["target_id"]
                     name = medal["anchor_info"]["nick_name"]
+                    room_id = medal["room_info"]["room_id"]
 
                     try:
-                        await self.api.signIn(uid)
+                        await self.api.signIn(uid, room_id)
+                        # 成功 —— 记录到本地日志（去重由 _mark_task_done 处理）
+                        self._mark_task_done(uid, "sign")
+                        self.fail_count=0
                         self.log.success(f"{name} 活动签到成功")
-
                         try:
                             self.sign_list.remove(medal)
                         except ValueError:
                             pass
 
                     except Exception as e:
-                        self.sign_list.remove(medal)
-                        if str(e.code) != "10004" and str(e.code) != "10009":
+                        # 先移除，后根据错误码决定是否重试或视为已签到
+                        try:
+                            self.sign_list.remove(medal)
+                        except ValueError:
+                            pass
+
+                        code_str = str(getattr(e, "code", "") or getattr(e, "status", "") or "")
+                        # 如果是已经签到的标识（10009），也记录为完成，避免后续重试
+                        if code_str == "10009":
+                            self._mark_task_done(uid, "sign")
+                            self.log.info(f"{name} 活动签到: 已签到 (code=10009)，记录为已完成")
+                            continue
+
+                        # 10004 保留你原来的特殊处理（如果你需要视为特定类型错误），这里保持不重试的策略
+                        if code_str != "10004":
+                            # 可重试的错误：放到队尾（最多重试 4 次）
                             if uid not in self.failed_sign:
                                 self.failed_sign[uid]=0
                             else:
                                 self.failed_sign[uid]+=1
-                            if self.failed_sign[uid]<4:
+                            if self.failed_sign[uid]<3:
                                 self.sign_list.append(medal)
-                                self.log.warning(f"{name} 活动签到失败: {e}，放到列表最后，当前重试次数{self.failed_sign[uid]}/4")
+                                self.log.warning(f"{name} 活动签到失败: {e}，放到列表最后，当前重试次数{self.failed_sign[uid]}/3")
+                                if code_str == "10007":
+                                    self.fail_count+=1
+                                    await asyncio.sleep(5*min(3,self.fail_count))
                             else:
                                 self.log.warning(f"{name} 活动签到失败: {e}，达到最大重试，放弃重试")
                         else:
+                            # 10004 或其他无需重试的错误
                             self.log.warning(f"{name} 活动签到失败: {e}")
-
                 await asyncio.sleep(5)
 
         # ---------- 观看管理子循环 ----------
