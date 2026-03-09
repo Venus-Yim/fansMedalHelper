@@ -14,10 +14,11 @@ import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logger.remove()
+logger = logger.bind(user="未知用户", uid="")
 logger.add(
     sys.stdout,
     colorize=True,
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> <blue>{extra[user]}</blue> <level>{message}</level>",
+    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> <blue>{extra[user]!s}</blue> <level>{message}</level>",
     backtrace=False,
     diagnose=False,
 )
@@ -30,8 +31,10 @@ class BiliUser:
     非大航海房间通过点赞或弹幕来维持灯牌点亮
     所有房间均能通过25 min有效观时来获得30基础亲密度
     """
-    def __init__(self, access_token: str, whiteUIDs: str = '', bannedUIDs: str = '', config: dict = {}):
+    def __init__(self, access_token: str, whiteUIDs: str = '', bannedUIDs: str = '', config: dict = {},
+             session: ClientSession = None, cookie: str = None):
         from .api import BiliApi
+
         def _parse_uid_input(uids):
             """
             将多种可能的输入规范化为 int 列表。
@@ -43,22 +46,16 @@ class BiliUser:
             """
             if not uids:
                 return []
-            # 如果已经是 list/tuple：直接尝试转换每一项
             if isinstance(uids, (list, tuple)):
                 out = []
                 for x in uids:
                     try:
                         out.append(int(x))
                     except Exception:
-                        # 忽略不可转项
                         continue
                 return out
-
-            # 如果是字符串，按逗号切分并提取数字
             if isinstance(uids, str):
-                # 先去掉常见的方括号、引号等，防止像 "[1,2]" 导致单项无法转 int
                 s = uids.strip()
-                # 去掉方括号和单/双引号（如果是像 "[1,2]"）
                 s = s.strip("[]\"'")
                 parts = [p.strip() for p in s.split(",") if p.strip()]
                 out = []
@@ -66,15 +63,11 @@ class BiliUser:
                     try:
                         out.append(int(p))
                     except Exception:
-                        # 尝试从字符串中提取连续数字（比如 "id: 1234"）
                         import re
                         m = re.search(r"(\d+)", p)
                         if m:
                             out.append(int(m.group(1)))
-                        # 否则忽略
                 return out
-
-            # 其他类型（如单个 int）
             try:
                 return [int(uids)]
             except Exception:
@@ -90,9 +83,36 @@ class BiliUser:
         self.message = []
         self.errmsg = []
         self.is_awake = True
-        
-        self.uuids = str(uuid.uuid4())
-        self.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
+
+        self.uuids = [str(uuid.uuid4()), str(uuid.uuid4())]
+
+        # 如果外部传入了 ClientSession，复用它；否则新建一份
+        if session is not None:
+            self.session = session
+            self._owns_session = False
+        else:
+            self.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
+            self._owns_session = True
+
+        # 用户通过配置传入原始 Cookie header 字符串（例如浏览器抓包得到的），尝试注入到 session.cookie_jar
+        if cookie:
+            try:
+                def parse_cookie_str(cookie_str: str) -> dict:
+                    pairs = [p.strip() for p in cookie_str.split(";") if "=" in p]
+                    out = {}
+                    for p in pairs:
+                        k, v = p.split("=", 1)
+                        out[k.strip()] = v.strip()
+                    return out
+
+                cookies = parse_cookie_str(cookie)
+                cookies = {k: str(v) for k, v in cookies.items()}
+                # update_cookies 接受 dict
+                self.session.cookie_jar.update_cookies(cookies)
+                logger.info("已将配置中的 cookie 注入 session.cookie_jar（请确认包含 SESSDATA 与 bili_jct）")
+            except Exception as e:
+                logger.warning(f"注入 cookie 失败: {e}")
+
         self.api = BiliApi(self, self.session)
         self._current_watch_task = None
         self._retry_info_like = {}
@@ -102,8 +122,8 @@ class BiliUser:
         self.log_file = f"logs/{self.uuids}.log"
         self.sink_id = logger.add(
             self.log_file,
-            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}",
-            filter=lambda record: record["extra"].get("uid") == self.uuids,
+            format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {extra[user]} | {message}",
+            filter=lambda record: record.get("extra", {}).get("uid") == self.uuids,
             encoding="utf-8"
         )
     
@@ -165,6 +185,7 @@ class BiliUser:
         like_cd=self.config.get("LIKE_CD",0.3)
         danmaku_cd=self.config.get("DANMAKU_CD",3)
         watch_cd=self.config.get("WATCH_TARGET",25)
+        signin_on=self.config.get("SIGN_IN",0)#0不启用，1对拥有的全部（不在黑名单内的）粉丝勋章启用（无论是否启用了观看白名单），2对白名单内的粉丝勋章启用
         
         self.log.info(f"开始获取任务列表，粉丝牌顺序为（排名先后即为执行任务先后）：")
         
@@ -182,13 +203,13 @@ class BiliUser:
                         self.medals.append(medal)
                         self.log.info(f"{name}(uid：{uid})")
                     else:
-                        self.log.error(f"白名单 {name}(uid：{uid}) 的粉丝牌 未拥有或被删除，已跳过")
+                        self.log.error(f"白名单 {name}(uid：{uid}) 的粉丝牌 未拥有或被删除2，已跳过")
                 else:
-                    self.log.error(f"白名单 uid：{uid} 对应的主播 不存在，已跳过")
+                    self.log.error(f"白名单 uid：{uid} 对应的粉丝牌 未拥有或被删除，已跳过")
         else:
             # 不使用白名单，添加所有勋章，剔除黑名单
             for uid, medal in all_medals.items():
-                anchor_info = medal.get("anchor_info")
+                anchor_info = (medal.get("anchor_info") if medal else None)
                 if anchor_info:
                     name = anchor_info.get("nick_name", "未知主播")
                     if uid not in self.bannedList:
@@ -203,6 +224,8 @@ class BiliUser:
         self.like_list = []
         self.danmaku_list = []
         self.watch_list = []
+        self.sign_list = []
+        self.failed_sign = dict()
 
         today = self._now_beijing().strftime("%Y-%m-%d")
         logs = self._load_log().get(today, {})
@@ -210,8 +233,8 @@ class BiliUser:
 
         for medal in self.medals:
             uid = medal["medal"]["target_id"]
-            if like_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "like") and medal["medal"]["guard_level"]>0)):
-                self.like_list.append(medal)
+            #if like_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "like") and medal["medal"]["guard_level"]>0)):
+            #self.like_list.append(medal)
             if danmaku_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "danmaku") and medal["medal"]["guard_level"]>0)):
                 self.danmaku_list.append(medal)
             if watch_cd:
@@ -221,8 +244,17 @@ class BiliUser:
                         self.watch_list.append(medal)
                 except Exception as e:
                     self.log.warning(f"{medal['anchor_info']['nick_name']} 获取直播状态失败: {e}")
-            
-        self.log.success(f"任务列表共 {len(self.medals)} 个粉丝牌(待点赞: {len(self.like_list)}, 待弹幕: {len(self.danmaku_list)}, 待观看: {len(self.watch_list)})\n")
+            if signin_on == 2:
+                self.sign_list.append(medal)
+        
+        if signin_on == 1:
+            for uid, medal in all_medals.items():
+                if uid not in self.bannedList:
+                    self.sign_list.append(medal)
+                
+                    
+        self.log.error(f"因b站接口更新，点赞模块暂不可用，此功能临时关闭，请关注本项目后续更新。受影响功能有：1.大航海每日开播自动点赞；2.非大航海开播期间自动点亮。")
+        self.log.success(f"任务列表共 {len(self.medals)} 个粉丝牌(待点赞: {len(self.like_list)}, 待弹幕: {len(self.danmaku_list)}, 待观看: {len(self.watch_list)}, 待签到: {len(self.sign_list)})\n")
 
     # ------------------------- 点赞任务 -------------------------
     async def like_room(self, room_id, medal, times=5):
@@ -271,8 +303,10 @@ class BiliUser:
                     await asyncio.sleep(cd)  # 使用配置中的间隔
                     break  # 成功后跳出重试循环
                 except Exception as e:
+                    import traceback
                     fail_count += 1
-                    self.log.warning(f"{name} 第 {i+1}/{times} 条弹幕失败: {e}，进行重试 (第{fail_count}/3次)")
+                    self.log.warning(f"{name} 第 {i+1}/{times} 次点赞失败: {e}， 进行重试 (第{fail_count}/3次)\n{traceback.format_exc()}")
+    
                         
                     if fail_count < 3:
                         await asyncio.sleep(5)  # 等待5秒后重试
@@ -350,7 +384,7 @@ class BiliUser:
                 return True
 
             if attempts >= MAX_ATTEMPTS:
-                self.log.error(f"{name} 超过最大尝试 {MAX_ATTEMPTS} 分钟，停止观看。该灯牌被放至观看队列最后。")
+                self.log.error(f"{name} 超过最大尝试 {MAX_ATTEMPTS} 分钟，停止观看。当前已观看进度：{watched}/{WATCH_TARGET}。该灯牌被放至观看队列最后。")
                 self.watch_list.remove(medal)
                 self.watch_list.append(medal)
                 return False
@@ -580,8 +614,40 @@ class BiliUser:
                             del self._retry_info_like[key]
 
                 # Per-medal 控制已经大幅减少重复查询与日志，因此短 sleep 足够
-                await asyncio.sleep(5)
+                await asyncio.sleep(600)
+        
+        # ---------- 活动签到子循环 ----------
+        async def sign_in_loop():
+            while self.sign_list:
+                for medal in self.sign_list.copy():
+                    uid = medal["medal"]["target_id"]
+                    name = medal["anchor_info"]["nick_name"]
 
+                    try:
+                        await self.api.signIn(uid)
+                        self.log.success(f"{name} 活动签到成功")
+
+                        try:
+                            self.sign_list.remove(medal)
+                        except ValueError:
+                            pass
+
+                    except Exception as e:
+                        self.sign_list.remove(medal)
+                        if str(e.code) != "10004" and str(e.code) != "10009":
+                            if uid not in self.failed_sign:
+                                self.failed_sign[uid]=0
+                            else:
+                                self.failed_sign[uid]+=1
+                            if self.failed_sign[uid]<4:
+                                self.sign_list.append(medal)
+                                self.log.warning(f"{name} 活动签到失败: {e}，放到列表最后，当前重试次数{self.failed_sign[uid]}/4")
+                            else:
+                                self.log.warning(f"{name} 活动签到失败: {e}，达到最大重试，放弃重试")
+                        else:
+                            self.log.warning(f"{name} 活动签到失败: {e}")
+
+                await asyncio.sleep(5)
 
         # ---------- 观看管理子循环 ----------
         async def watch_manager_loop():
@@ -612,7 +678,7 @@ class BiliUser:
                     break
 
                 # 全部任务空闲且无后台观看，退出
-                if not (self.like_list or self.danmaku_list or self.watch_list or self._current_watch_task):
+                if not (self.like_list or self.danmaku_list or self.watch_list or self.sign_list or self._current_watch_task):
                     break
 
                 # 启动点赞/弹幕与 watch 管理子任务（如果尚未启动或已结束）
@@ -620,12 +686,15 @@ class BiliUser:
                     self._like_task = asyncio.create_task(like_danmaku_loop())
                 if not hasattr(self, "_watch_manager_task") or self._watch_manager_task.done():
                     self._watch_manager_task = asyncio.create_task(watch_manager_loop())
+                if not hasattr(self, "_sign_task") or self._sign_task.done():
+                    if self.sign_list:
+                        self._sign_task = asyncio.create_task(sign_in_loop())
 
                 # 主循环短睡以便周期性检查（如跨天），并不影响后台 watch task
                 await asyncio.sleep(5)
         finally:
             # 退出前尝试取消仍在运行的子任务（若有）
-            for tname in ("_like_task", "_watch_manager_task", "_day_watch_task"):
+            for tname in ("_like_task", "_watch_manager_task", "_sign_task", "_day_watch_task"):
                 task = getattr(self, tname, None)
                 if task and not task.done():
                     task.cancel()
@@ -651,8 +720,9 @@ class BiliUser:
         # 循环直到不需要继续（由跨天/CRON 决定）
         while True:
             # 建立 session（若无）
-            if not getattr(self.api, "session", None) or self.api.session.closed:
-                self.api.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
+            if not getattr(self, "session", None) or self.session.closed:
+                self.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
+                self.api.session = self.session
 
             # 登录验证
             if not await self.loginVerify():

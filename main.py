@@ -15,7 +15,7 @@ from src import BiliUser
 from src.update_checker import check_update
 
 log = logger.bind(user="B站粉丝牌助手")
-__VERSION__ = "2.0.2"
+__VERSION__ = "2.0.5"
 
 warnings.filterwarnings(
     "ignore",
@@ -36,12 +36,14 @@ try:
     assert users["WATCH_TARGET"] >= 0, "WATCH_TARGET参数错误"
     assert users["WATCH_MAX_ATTEMPTS"] >= users["WATCH_TARGET"], "WATCH_MAX_ATTEMPTS参数错误，不能小于WATCH_TARGET"
     assert users["WEARMEDAL"] in [0, 1], "WEARMEDAL参数错误"
+    assert users["SIGN_IN"] in [0, 1, 2], "SIGN_IN参数错误"
     config = {
         "LIKE_CD": users["LIKE_CD"],
         "DANMAKU_CD": users["DANMAKU_CD"],
         "WATCH_TARGET": users["WATCH_TARGET"],
         "WATCH_MAX_ATTEMPTS": users["WATCH_MAX_ATTEMPTS"],
         "WEARMEDAL": users["WEARMEDAL"],
+        "SIGN_IN": users["SIGN_IN"],
         "PROXY": users.get("PROXY"),
         "CRON": users.get("CRON"),
     }
@@ -85,6 +87,8 @@ async def main():
                     user.get("white_uid", ""),
                     user.get("banned_uid", ""),
                     config,
+                    session=session,                  # 复用外层 session
+                    cookie=user.get("cookie", None),  # 可选：users.yaml 为该用户配置 cookie 字符串
                 )
                 startTasks.append(biliUser.start())  # ✅ 新逻辑入口
 

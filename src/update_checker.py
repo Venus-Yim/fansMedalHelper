@@ -1,7 +1,7 @@
 import requests
 from loguru import logger
 
-CURRENT_VERSION = "2.0.4"
+CURRENT_VERSION = "2.0.5"
 VERSION_URL = "https://raw.githubusercontent.com/Venus-Yim/fansMedalHelper/master/version.txt"
 
 log = logger.bind(user="更新检查", module="update_checker")
