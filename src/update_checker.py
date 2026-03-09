@@ -8,9 +8,12 @@ log = logger.bind(user="更新检查", module="update_checker")
 
 def check_update():
     try:
-        latest = requests.get(VERSION_URL, timeout=2).text.strip()
+        lines = requests.get(VERSION_URL, timeout=2).text.strip().splitlines()
+
+        latest = lines[0] if len(lines) > 0 else ""
+        info = lines[1] if len(lines) > 1 else ""
         if latest != CURRENT_VERSION:
-            log.warning(f"发现新版本：{latest}（当前版本：{CURRENT_VERSION}）")
+            log.warning(f"发现新版本：{latest}（当前版本：{CURRENT_VERSION}），更新内容为：{info}")
         else:
             log.success(f"当前已是最新版本：{CURRENT_VERSION}")
     except Exception as e:
