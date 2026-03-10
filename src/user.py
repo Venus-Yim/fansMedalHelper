@@ -1,4 +1,4 @@
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout, CookieJar
 import asyncio
 import sys
 import os
@@ -86,13 +86,21 @@ class BiliUser:
 
         self.uuids = [str(uuid.uuid4()), str(uuid.uuid4())]
 
-        # 如果外部传入了 ClientSession，复用它；否则新建一份
-        if session is not None:
-            self.session = session
-            self._owns_session = False
-        else:
-            self.session = ClientSession(timeout=ClientTimeout(total=5), trust_env=True)
+        # 为每个用户创建独立的 ClientSession（含独立 CookieJar）。
+        try:
+            timeout = ClientTimeout(total=5)
+            # 每个用户单独一个 CookieJar，避免不同用户间 cookie 被覆盖
+            self.session = ClientSession(timeout=timeout, trust_env=True, cookie_jar=CookieJar())
             self._owns_session = True
+            logger.info("为该用户创建独立的 ClientSession 与 CookieJar（避免共享 session 导致 cookie 覆盖）")
+        except Exception as e:
+            # 回退（极少发生）——若创建失败再尝试使用外部传入的 session（如果有）
+            if session is not None:
+                self.session = session
+                self._owns_session = False
+                logger.warning(f"创建独立 ClientSession 失败，回退为传入的 session：{e}")
+            else:
+                raise
 
         # 用户通过配置传入原始 Cookie header 字符串（例如浏览器抓包得到的），尝试注入到 session.cookie_jar
         if cookie:

@@ -189,6 +189,9 @@ class BiliApi:
         self.u = u
         self.session = s
         self._wbi_cache = None
+        # create per-instance headers copy to avoid cross-user mutation
+        # NOTE: BiliApi.headers 原为类属性；在实例化时复制一份到 self.headers
+        self.headers = dict(self.__class__.headers)
 
     def __check_response(self, resp: dict) -> dict:
         if resp["code"] != 0 or ("mode_info" in resp["data"] and resp["message"] != ""):
