@@ -659,25 +659,39 @@ class BiliUser:
                             self._mark_task_done(uid, "sign")
                             self.log.info(f"{name} 活动签到: 已签到 (code=10009)，记录为已完成")
                             continue
+                        
+                        if code_str == "10004":
+                            self._mark_task_done(uid, "sign")
+                            self.log.info(f"{name} 活动签到: 为自己房间 (code=10004)，记录为已完成")
+                            continue
+                        
+                        if code_str == "10007":
+                            self.log.info(f"{name} 活动签到: 当前房间粉丝牌未拥有或被删除 (code=10007)，不记录，不自动重试")
+                            continue
+                        
+                        if code_str == "10019":
+                            self._mark_task_done(uid, "sign")
+                            self.log.info(f"{name} 活动签到: 均已补签 (code=10019)，记录为已完成")
+                            continue
+                        
+                        if code_str == "1300012":
+                            self.log.info(f"{name} 活动签到: 补签需消耗的电池/次数余额不足 (code=1300012)，不记录，不自动重试")
+                            continue
 
-                        # 10004 保留你原来的特殊处理（如果你需要视为特定类型错误），这里保持不重试的策略
-                        if code_str != "10004":
-                            # 可重试的错误：放到队尾（最多重试 4 次）
-                            if uid not in self.failed_sign:
-                                self.failed_sign[uid]=0
-                            else:
-                                self.failed_sign[uid]+=1
-                            if self.failed_sign[uid]<3:
-                                self.sign_list.append(medal)
-                                self.log.warning(f"{name} 活动签到失败: {e}，放到列表最后，当前重试次数{self.failed_sign[uid]}/3")
-                                if code_str == "10007":
-                                    self.fail_count+=1
-                                    await asyncio.sleep(5*min(3,self.fail_count))
-                            else:
-                                self.log.warning(f"{name} 活动签到失败: {e}，达到最大重试，放弃重试")
+                        # 可重试的错误：放到队尾（最多重试 3 次）
+                        if uid not in self.failed_sign:
+                            self.failed_sign[uid]=0
                         else:
-                            # 10004 或其他无需重试的错误
-                            self.log.warning(f"{name} 活动签到失败: {e}")
+                            self.failed_sign[uid]+=1
+                        if self.failed_sign[uid]<3:
+                            self.sign_list.append(medal)
+                            self.log.warning(f"{name} 活动签到失败: {e}，放到列表最后，当前重试次数{self.failed_sign[uid]}/3")
+                            if code_str == "10007":
+                                self.fail_count+=1
+                                await asyncio.sleep(5*min(3,self.fail_count))
+                        else:
+                            self.log.warning(f"{name} 活动签到失败: {e}，达到最大重试，放弃重试")
+
                 await asyncio.sleep(5)
 
         # ---------- 观看管理子循环 ----------

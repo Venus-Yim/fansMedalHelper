@@ -563,6 +563,83 @@ class BiliApi:
             data = await resp.json()
 
         return self.__check_response(data)
+    
+#     #要使用补签的，注释掉上面那个signin，把下面这个去掉注释，删除src文件夹里所有.json文件，重新运行程序。切换回签到时也建议再删除一次.json文件。
+#     #！注意！使用补签，在非首次补签直播间会自动消耗电池进行补签，不希望消耗电池的请先将电池用完
+#     @retry()
+#     async def signIn(self, ruid: int, room_id: int, activity_id: int = 109745):
+#         """
+#         Perform DoMakeupSignIn (补签).
+#         Mirrors the captured request:
+#         POST https://api.live.bilibili.com/xlive/custom-activity-interface/baseActivity/DoMakeupSignIn
+#         with query params and empty body.
+#         """
+#         url = "https://api.live.bilibili.com/xlive/custom-activity-interface/baseActivity/DoMakeupSignIn"
+# 
+#         # 读取 csrf (bili_jct)
+#         bili_jct = None
+#         try:
+#             jar = getattr(self.session, "cookie_jar", None)
+#             if jar:
+#                 cookies = jar.filter_cookies("https://api.live.bilibili.com")
+#                 if "bili_jct" in cookies:
+#                     bili_jct = cookies["bili_jct"].value
+#         except Exception as ex:
+#             print(f"[API] cookie read failure: {ex}", flush=True)
+# 
+#         if not bili_jct:
+#             # 回退到 headers 中查找
+#             cookie_hdr = getattr(self, "headers", {}).get("Cookie", "") if hasattr(self, "headers") else ""
+#             m = re.search(r"bili_jct=([^;]+)", cookie_hdr)
+#             if m:
+#                 bili_jct = m.group(1)
+# 
+#         csrf = str(bili_jct or "")
+# 
+#         params = {
+#             "access_key": "",
+#             "activity_id": activity_id,
+#             "brand": "",
+#             "build": "",
+#             "channel": "",
+#             "csrf": csrf,
+#             "device": "",
+#             "mobi_app": "",
+#             "model": "",
+#             "osver": "",
+#             "platform": "web",
+#             "ruid": ruid
+#         }
+# 
+#         headers = {
+#             "Origin": "https://live.bilibili.com",
+#             "Referer": f"https://live.bilibili.com/{room_id}",
+#             "User-Agent": getattr(self, "headers", {}).get("User-Agent", "Mozilla/5.0"),
+#             "Content-Type": "application/x-www-form-urlencoded",
+#             "Accept": "*/*",
+#         }
+# 
+#         async with self.session.post(
+#             url,
+#             params=params,
+#             headers=headers,
+#             data=""
+#         ) as resp:
+#             # 尝试解析 JSON，若失败则回退到文本并尝试 json.loads
+#             try:
+#                 data = await resp.json()
+#             except Exception:
+#                 text = await resp.text()
+#                 try:
+#                     data = json.loads(text)
+#                 except Exception:
+#                     # 给出更明确的错误，便于调试抓包/服务器返回
+#                     raise RuntimeError(
+#                         f"[API] unexpected response. content-type={resp.headers.get('content-type')!r}, "
+#                         f"status={resp.status}, body={text[:1000]!r}"
+#                     )
+# 
+#         return self.__check_response(data)
 
     # async def entryRoom(self, room_id: int, up_id: int):
     #     data = {
