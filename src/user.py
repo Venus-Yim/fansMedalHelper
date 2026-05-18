@@ -241,8 +241,8 @@ class BiliUser:
 
         for medal in self.medals:
             uid = medal["medal"]["target_id"]
-            #if like_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "like"))):
-            #self.like_list.append(medal)
+            if like_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "like"))):
+                self.like_list.append(medal)
             if danmaku_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "danmaku"))):
                 self.danmaku_list.append(medal)
             if watch_cd:
@@ -500,7 +500,6 @@ class BiliUser:
 
                     uid = medal["medal"]["target_id"]
                     room_id = medal["room_info"]["room_id"]
-                    guard = medal["medal"]["guard_level"]
 
                     try:
                         status = await self.api.getRoomLiveStatus(room_id)
@@ -520,13 +519,12 @@ class BiliUser:
                         st["next_check"] = now + 60  # 状态不符合时短退避
                         if st["fail_count"] == 1 or (now - st["last_log"] > LOG_INTERVAL):
                             st["last_log"] = now
-                            if guard > 0:
-                                self.log.info(f"{medal['anchor_info']['nick_name']} 未开播，点赞任务加入重试列表")
+                            self.log.info(f"{medal['anchor_info']['nick_name']} 未开播，点赞任务加入重试列表")
                         continue
 
                     # 真正执行点赞 —— 成功后移除 retry 状态并清理列表
                     try:
-                        times = 10 if guard > 0 else 38
+                        times = 300
                         await self.like_room(room_id, medal, times=times)
                     except Exception as e:
                         # 如果点赞内部失败，也按指数退避处理并节流日志
@@ -547,16 +545,6 @@ class BiliUser:
                     if key in self._retry_info_like:
                         del self._retry_info_like[key]
 
-                    # 如果是非大航海，并且也在弹幕列表中，则移除弹幕任务
-                    if guard == 0 and medal in self.danmaku_list:
-                        try:
-                            self.danmaku_list.remove(medal)
-                        except ValueError:
-                            pass
-                        self._mark_task_done(uid, "danmaku")
-                        # 清理对应 danmaku retry state
-                        if key in self._retry_info_danmaku:
-                            del self._retry_info_danmaku[key]
                 
                 # 弹幕
                 for medal in self.danmaku_list.copy():
@@ -568,7 +556,6 @@ class BiliUser:
                     
                     uid = medal["medal"]["target_id"]
                     room_id = medal["room_info"]["room_id"]
-                    guard = medal["medal"]["guard_level"]
 
                     try:
                         status = await self.api.getRoomLiveStatus(room_id)
@@ -587,13 +574,12 @@ class BiliUser:
                         st["next_check"] = now + 60
                         if st["fail_count"] == 1 or (now - st["last_log"] > LOG_INTERVAL):
                             st["last_log"] = now
-                            if guard > 0:
-                                self.log.info(f"{medal['anchor_info']['nick_name']} 开播中，弹幕任务加入重试列表")
+                            self.log.info(f"{medal['anchor_info']['nick_name']} 开播中，弹幕任务加入重试列表")
                         continue
                     
                     # 真正执行弹幕
                     try:
-                        times = 5 if guard > 0 else 10
+                        times = 10
                         await self.send_danmaku(room_id, medal, times=times)
                     except Exception as e:
                         st["fail_count"] += 1
@@ -612,16 +598,6 @@ class BiliUser:
                     self._mark_task_done(uid, "danmaku")
                     if key in self._retry_info_danmaku:
                         del self._retry_info_danmaku[key]
-
-                    if guard == 0 and medal in self.like_list:
-                        try:
-                            self.like_list.remove(medal)
-                        except ValueError:
-                            pass
-                        self._mark_task_done(uid, "like")
-                        # 清理对应 like retry state
-                        if key in self._retry_info_like:
-                            del self._retry_info_like[key]
 
                 # Per-medal 控制已经大幅减少重复查询与日志，因此短 sleep 足够
                 await asyncio.sleep(600)
