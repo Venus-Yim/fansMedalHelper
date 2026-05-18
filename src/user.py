@@ -27,9 +27,8 @@ logger.add(
 class BiliUser:
     """
     按直播间状态与大航海身份执行点赞、弹幕、观看任务
-    在2025.9更新后，大航海房间每日  点赞五次+弹幕五条  实际上仍能获得(5+5)*1.5(大航海系数加成)=15亲密度
-    非大航海房间通过点赞或弹幕来维持灯牌点亮
-    所有房间均能通过25 min有效观时来获得30基础亲密度
+    在2026.5更新后，大航海与粉丝团使用同一套任务，大航海仍享受1.5倍加成
+    150分钟观时(10亲密度)+10弹幕(10亲密度)+300点赞(10亲密度)
     """
     def __init__(self, access_token: str, whiteUIDs: str = '', bannedUIDs: str = '', config: dict = {},
              session: ClientSession = None, cookie: str = None):
@@ -242,9 +241,9 @@ class BiliUser:
 
         for medal in self.medals:
             uid = medal["medal"]["target_id"]
-            #if like_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "like") and medal["medal"]["guard_level"]>0)):
+            #if like_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "like"))):
             #self.like_list.append(medal)
-            if danmaku_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "danmaku") and medal["medal"]["guard_level"]>0)):
+            if danmaku_cd and (medal['medal']['is_lighted']==0 or (not self._is_task_done(uid, "danmaku"))):
                 self.danmaku_list.append(medal)
             if watch_cd:
                 try:
@@ -257,6 +256,7 @@ class BiliUser:
                 self.sign_list.append(medal)
         
         if signin_on == 1:
+            print(self.bannedList)
             for uid, medal in all_medals.items():
                 if uid not in self.bannedList and not self._is_task_done(uid, "sign"):
                     self.sign_list.append(medal)

@@ -1,7 +1,7 @@
 import requests
 from loguru import logger
 
-CURRENT_VERSION = "2.0.6"
+CURRENT_VERSION = "2.0.7"
 VERSION_URL = "https://raw.githubusercontent.com/Venus-Yim/fansMedalHelper/master/version.txt"
 
 log = logger.bind(user="更新检查", module="update_checker")
@@ -19,4 +19,3 @@ def check_update():
     except Exception as e:
 
         log.warning(f"检查版本失败：{e}")
-
